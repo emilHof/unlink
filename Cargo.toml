@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Lock free linked list"
 homepage = "https://github.com/emilHof/unlink"
-documentation "https://github.com/emilHof/unlink"
+documentation = "https://github.com/emilHof/unlink"
 repository = "https://github.com/emilHof/unlink"
 readme = "./README.md"
 
