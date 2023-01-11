@@ -1,7 +1,7 @@
 use crate::MaybeTagged;
 use alloc::alloc::{alloc, dealloc};
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use haphazard::{Domain, HazardPointer, Singleton};
 
 pub struct Node<V> {
@@ -41,7 +41,7 @@ const unsafe fn layout<T>() -> core::alloc::Layout {
     core::alloc::Layout::from_size_align_unchecked(size, align)
 }
 
-struct List<V> {
+pub struct Stack<V> {
     head: MaybeTagged<Node<V>>,
     len: AtomicUsize,
 }
@@ -52,9 +52,9 @@ unsafe impl Singleton for UniqueFamily {}
 
 static UNIQUE_FAMILY: Domain<UniqueFamily> = Domain::new(&UniqueFamily);
 
-impl<V> List<V> {
+impl<V> Stack<V> {
     pub fn new() -> Self {
-        List {
+        Stack {
             head: MaybeTagged::new(null_mut()),
             len: AtomicUsize::new(0),
         }
@@ -70,8 +70,11 @@ impl<V> List<V> {
     }
 }
 
-impl<V> List<V> {
-    pub fn push<'a>(&'a self, val: V) -> NodeRef<'a, V> {
+impl<V> Stack<V>
+where
+    V: Send + Sync,
+{
+    pub fn push(&self, val: V) {
         let node_ptr = Node::new(val);
         let node = NodeRef::from_ptr(node_ptr);
 
@@ -79,42 +82,84 @@ impl<V> List<V> {
 
         node.next.store_ptr(head_ptr);
 
-        while let Err((now, _)) = self.head.compare_exchange(head_ptr, node_ptr) {
+        while let Err((now, _)) =
+            self.head
+                .compare_exchange(head_ptr, node_ptr, Ordering::AcqRel, Ordering::Relaxed)
+        {
             node.next.store_ptr(now);
             head_ptr = now;
         }
 
         self.len.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        node
     }
 
-    pub fn pop<'a>(&'a self) -> Option<NodeRef<'a, V>> {
-        let mut head = NodeRef::from_maybe_tagged(&self.head)?;
+    pub fn pop(&self) -> Option<Entry<'_, V>> {
+        let mut old_head = NodeRef::from_maybe_tagged(&self.head)?;
 
-        let mut next_ptr = head.next.load_ptr();
+        let mut next_ptr = old_head.next.load_ptr();
 
-        while let Err((_, _)) = self.head.compare_exchange(head.as_ptr(), next_ptr) {
-            head = NodeRef::from_maybe_tagged(&self.head)?;
+        while let Err((_, _)) = self.head.compare_exchange(
+            old_head.as_ptr(),
+            next_ptr,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            old_head = NodeRef::from_maybe_tagged(&self.head)?;
 
-            next_ptr = head.next.load_ptr();
+            next_ptr = old_head.next.load_ptr();
         }
 
-        Some(head)
+        unsafe {
+            UNIQUE_FAMILY.retire_ptr::<_, DropNode<_>>(old_head.as_ptr());
+        }
+
+        Some(old_head.into())
     }
 
-    pub fn peek_front<'a>(&'a self) -> Option<NodeRef<'a, V>> {
+    pub fn peek(&self) -> Option<NodeRef<'_, V>> {
         NodeRef::from_maybe_tagged(&self.head)
     }
 
-    pub fn iter<'a>(&'a self) -> Iter<'a, V> {
-        Iter {
-            next: self.peek_front(),
+    pub fn extend(&self, other: Self) {
+        let Some(new_head) = NodeRef::from_maybe_tagged(&other.head) else {
+            return;
+        };
+
+        other.head.store_ptr(null_mut());
+
+        let mut tail = new_head.as_ptr();
+        unsafe {
+            while !(*tail).next.load_ptr().is_null() {
+                tail = (*tail).next.load_ptr();
+            }
+            tail
+        };
+
+        let mut old_head = self.head.load_ptr();
+
+        unsafe {
+            (*tail).next.store_ptr(old_head);
         }
+
+        while let Err((now, _)) = self.head.compare_exchange(
+            old_head,
+            new_head.as_ptr(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            old_head = now;
+            unsafe {
+                (*tail).next.store_ptr(old_head);
+            }
+        }
+    }
+
+    pub fn iter<'a>(&'a self) -> Iter<'a, V> {
+        Iter { next: self.peek() }
     }
 }
 
-impl<V> Drop for List<V> {
+impl<V> Drop for Stack<V> {
     fn drop(&mut self) {
         let mut curr = self.head.load_ptr();
 
@@ -187,6 +232,58 @@ impl<'a, V> NodeRef<'a, V> {
     }
 }
 
+#[repr(transparent)]
+struct DropNode<V>(NonNull<Node<V>>);
+
+impl<V> Drop for DropNode<V> {
+    fn drop(&mut self) {
+        unsafe {
+            Node::drop(self.0.as_ptr());
+        }
+    }
+}
+
+impl<V> core::ops::Deref for DropNode<V> {
+    type Target = Node<V>;
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+unsafe impl<V> haphazard::raw::Pointer<Node<V>> for DropNode<V> {
+    fn into_raw(self) -> *mut Node<V> {
+        self.0.as_ptr()
+    }
+
+    unsafe fn from_raw(ptr: *mut Node<V>) -> Self {
+        Self(NonNull::new_unchecked(ptr))
+    }
+}
+
+pub struct Entry<'a, V> {
+    node: NonNull<Node<V>>,
+    _hazard: haphazard::HazardPointer<'a, UniqueFamily>,
+}
+
+impl<'a, V> core::ops::Deref for Entry<'a, V> {
+    type Target = Node<V>;
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.node.as_ref() }
+    }
+}
+
+impl<'a, V> core::ops::Drop for Entry<'a, V> {
+    fn drop(&mut self) {
+        UNIQUE_FAMILY.eager_reclaim();
+    }
+}
+
+impl<'a, V> From<NodeRef<'a, V>> for Entry<'a, V> {
+    fn from(node_ref: NodeRef<'a, V>) -> Self {
+        unsafe { core::mem::transmute(node_ref) }
+    }
+}
+
 pub struct Iter<'a, V> {
     next: Option<NodeRef<'a, V>>,
 }
@@ -220,7 +317,7 @@ mod test {
 
     #[test]
     fn test_push_front() {
-        let list = List::new();
+        let list = Stack::new();
 
         list.push(1);
 
@@ -231,7 +328,7 @@ mod test {
 
     #[test]
     fn test_push_pop_sync() {
-        let list = Arc::new(List::new());
+        let list = Arc::new(Stack::new());
 
         let mut threads = vec![];
 
@@ -254,5 +351,30 @@ mod test {
         }
 
         list.iter().for_each(|n| println!("val: {}", n.val));
+    }
+
+    #[test]
+    fn test_extend() {
+        let expected = vec![2, 3, 7, 2, 0, 0, 3, 4, 2, 5];
+
+        let stack = Stack::new();
+
+        expected[expected.len() / 2..]
+            .iter()
+            .rev()
+            .for_each(|&e| stack.push(e));
+
+        let other = Stack::new();
+
+        expected[..expected.len() / 2]
+            .iter()
+            .rev()
+            .for_each(|&e| other.push(e));
+
+        stack.extend(other);
+
+        let actual: Vec<i32> = stack.iter().map(|e| e.val).collect();
+
+        assert_eq!(expected, actual);
     }
 }
