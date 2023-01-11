@@ -16,4 +16,4 @@ haphazard = "0.1"
 arbitrary = { version = "1", optional = true, features = ["derive"] }
 
 [dev-dependencies]
-rand = "*"
+rand = "0.8"
