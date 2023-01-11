@@ -43,7 +43,6 @@ const unsafe fn layout<T>() -> core::alloc::Layout {
 
 struct List<V> {
     head: MaybeTagged<Node<V>>,
-    domain: haphazard::Domain<UniqueFamily>,
     len: AtomicUsize,
 }
 
@@ -51,11 +50,12 @@ struct UniqueFamily;
 
 unsafe impl Singleton for UniqueFamily {}
 
+static UNIQUE_FAMILY: Domain<UniqueFamily> = Domain::new(&UniqueFamily);
+
 impl<V> List<V> {
     pub fn new() -> Self {
         List {
             head: MaybeTagged::new(null_mut()),
-            domain: Domain::new(&UniqueFamily),
             len: AtomicUsize::new(0),
         }
     }
@@ -130,7 +130,7 @@ impl<V> Drop for List<V> {
 
 pub struct NodeRef<'a, V> {
     node: NonNull<Node<V>>,
-    _hazard: HazardPointer<'a>,
+    _hazard: HazardPointer<'a, UniqueFamily>,
 }
 
 impl<'a, V> NodeRef<'a, V> {
@@ -150,7 +150,7 @@ impl<'a, V> NodeRef<'a, V> {
     pub(crate) fn from_ptr(ptr: *mut Node<V>) -> Self {
         assert!(!ptr.is_null());
 
-        let mut _hazard = HazardPointer::new();
+        let mut _hazard = HazardPointer::new_in_domain(&UNIQUE_FAMILY);
 
         _hazard.protect_raw(ptr);
 
@@ -159,8 +159,8 @@ impl<'a, V> NodeRef<'a, V> {
         NodeRef { node, _hazard }
     }
 
-    pub(crate) fn from_maybe_tagged(maybe_tagged: &MaybeTagged<Node<V>>) -> Option<Self> {
-        let mut _hazard = HazardPointer::new();
+    fn from_maybe_tagged(maybe_tagged: &MaybeTagged<Node<V>>) -> Option<Self> {
+        let mut _hazard = HazardPointer::new_in_domain(&UNIQUE_FAMILY);
         let mut ptr = maybe_tagged.load_ptr();
 
         _hazard.protect_raw(ptr);
