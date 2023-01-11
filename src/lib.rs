@@ -1,14 +1,6 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
+mod base;
+mod tagged;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) use tagged::MaybeTagged;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+extern crate alloc;
