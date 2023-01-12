@@ -1,12 +1,11 @@
-use crate::MaybeTagged;
 use alloc::alloc::{alloc, dealloc};
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use haphazard::{Domain, HazardPointer, Singleton};
 
-pub struct Node<V> {
+struct Node<V> {
     pub val: V,
-    pub(crate) next: MaybeTagged<Self>,
+    next: AtomicPtr<Self>,
 }
 
 impl<V> Node<V> {
@@ -41,21 +40,30 @@ const unsafe fn layout<T>() -> core::alloc::Layout {
     core::alloc::Layout::from_size_align_unchecked(size, align)
 }
 
-pub struct Stack<V> {
-    head: MaybeTagged<Node<V>>,
-    len: AtomicUsize,
-}
-
+/// [UniqueFamily](UniqueFamily) enables type checking for [HazardPointers](HazardPointer)
 struct UniqueFamily;
 
 unsafe impl Singleton for UniqueFamily {}
 
 static UNIQUE_FAMILY: Domain<UniqueFamily> = Domain::new(&UniqueFamily);
 
+pub struct Stack<V> {
+    head: AtomicPtr<Node<V>>,
+    domain: &'static Domain<UniqueFamily>,
+    len: AtomicUsize,
+}
+
+impl<V> core::fmt::Debug for Stack<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stack").finish()
+    }
+}
+
 impl<V> Stack<V> {
     pub fn new() -> Self {
         Stack {
-            head: MaybeTagged::new(null_mut()),
+            head: AtomicPtr::new(null_mut()),
+            domain: &UNIQUE_FAMILY,
             len: AtomicUsize::new(0),
         }
     }
@@ -78,15 +86,15 @@ where
         let node_ptr = Node::new(val);
         let node = NodeRef::from_ptr(node_ptr);
 
-        let mut head_ptr = self.head.load_ptr();
+        let mut head_ptr = self.head.load(Ordering::SeqCst);
 
-        node.next.store_ptr(head_ptr);
+        node.next.store(head_ptr, Ordering::SeqCst);
 
-        while let Err((now, _)) =
+        while let Err(now) =
             self.head
                 .compare_exchange(head_ptr, node_ptr, Ordering::AcqRel, Ordering::Relaxed)
         {
-            node.next.store_ptr(now);
+            node.next.store(now, Ordering::SeqCst);
             head_ptr = now;
         }
 
@@ -94,78 +102,80 @@ where
     }
 
     pub fn pop(&self) -> Option<Entry<'_, V>> {
-        let mut old_head = NodeRef::from_maybe_tagged(&self.head)?;
+        let mut old_head = NodeRef::from_atomic_ptr(&self.head)?;
 
-        let mut next_ptr = old_head.next.load_ptr();
+        let mut next_ptr = old_head.next.load(Ordering::SeqCst);
 
-        while let Err((_, _)) = self.head.compare_exchange(
+        while let Err(_) = self.head.compare_exchange(
             old_head.as_ptr(),
             next_ptr,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            old_head = NodeRef::from_maybe_tagged(&self.head)?;
+            old_head = NodeRef::from_atomic_ptr(&self.head)?;
 
-            next_ptr = old_head.next.load_ptr();
+            next_ptr = old_head.next.load(Ordering::SeqCst);
         }
 
         unsafe {
-            UNIQUE_FAMILY.retire_ptr::<_, DropNode<_>>(old_head.as_ptr());
+            self.domain.retire_ptr::<_, DropNode<_>>(old_head.as_ptr());
+            self.domain.eager_reclaim();
         }
 
         Some(old_head.into())
     }
 
-    pub fn peek(&self) -> Option<NodeRef<'_, V>> {
-        NodeRef::from_maybe_tagged(&self.head)
+    pub fn peek(&self) -> Option<Entry<'_, V>> {
+        NodeRef::from_atomic_ptr(&self.head).map(|n| n.into())
     }
 
     pub fn extend(&self, other: Self) {
-        let Some(new_head) = NodeRef::from_maybe_tagged(&other.head) else {
+        let Some(new_head) = NodeRef::from_atomic_ptr(&other.head) else {
             return;
         };
 
-        other.head.store_ptr(null_mut());
+        other.head.store(null_mut(), Ordering::SeqCst);
 
         let mut tail = new_head.as_ptr();
+
         unsafe {
-            while !(*tail).next.load_ptr().is_null() {
-                tail = (*tail).next.load_ptr();
+            while !(*tail).next.load(Ordering::SeqCst).is_null() {
+                tail = (*tail).next.load(Ordering::SeqCst);
             }
             tail
         };
 
-        let mut old_head = self.head.load_ptr();
+        let mut old_head = self.head.load(Ordering::SeqCst);
 
         unsafe {
-            (*tail).next.store_ptr(old_head);
+            (*tail).next.store(old_head, Ordering::SeqCst);
         }
 
-        while let Err((now, _)) = self.head.compare_exchange(
+        while let Err(head_now) = self.head.compare_exchange(
             old_head,
             new_head.as_ptr(),
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            old_head = now;
+            old_head = head_now;
             unsafe {
-                (*tail).next.store_ptr(old_head);
+                (*tail).next.store(old_head, Ordering::SeqCst);
             }
         }
-    }
-
-    pub fn iter<'a>(&'a self) -> Iter<'a, V> {
-        Iter { next: self.peek() }
     }
 }
 
 impl<V> Drop for Stack<V> {
     fn drop(&mut self) {
-        let mut curr = self.head.load_ptr();
+        // Deallocate all pointers that are no longer referred to.
+        self.domain.eager_reclaim();
 
+        let mut curr = self.head.load(Ordering::SeqCst);
+
+        // # Safety: We have exclusive ownership of self.
         unsafe {
             while !curr.is_null() {
-                let next = (*curr).next.load_ptr();
+                let next = (*curr).next.load(Ordering::SeqCst);
                 Node::drop(curr);
                 curr = next;
             }
@@ -173,7 +183,8 @@ impl<V> Drop for Stack<V> {
     }
 }
 
-pub struct NodeRef<'a, V> {
+/// [NodeRef](NodeRef) is a protected `*mut` to a Node. It will be valid until it is dropped.
+struct NodeRef<'a, V> {
     node: NonNull<Node<V>>,
     _hazard: HazardPointer<'a, UniqueFamily>,
 }
@@ -204,31 +215,12 @@ impl<'a, V> NodeRef<'a, V> {
         NodeRef { node, _hazard }
     }
 
-    fn from_maybe_tagged(maybe_tagged: &MaybeTagged<Node<V>>) -> Option<Self> {
+    fn from_atomic_ptr(ptr: &AtomicPtr<Node<V>>) -> Option<Self> {
         let mut _hazard = HazardPointer::new_in_domain(&UNIQUE_FAMILY);
-        let mut ptr = maybe_tagged.load_ptr();
 
-        _hazard.protect_raw(ptr);
+        let node = _hazard.protect_ptr(&ptr)?.0;
 
-        let mut v_ptr = maybe_tagged.load_ptr();
-
-        while !core::ptr::eq(ptr, v_ptr) {
-            ptr = v_ptr;
-            _hazard.protect_raw(ptr);
-
-            v_ptr = maybe_tagged.load_ptr();
-        }
-
-        if ptr.is_null() {
-            None
-        } else {
-            unsafe {
-                Some(NodeRef {
-                    node: core::ptr::NonNull::new_unchecked(ptr),
-                    _hazard,
-                })
-            }
-        }
+        Some(NodeRef { node, _hazard })
     }
 }
 
@@ -266,15 +258,9 @@ pub struct Entry<'a, V> {
 }
 
 impl<'a, V> core::ops::Deref for Entry<'a, V> {
-    type Target = Node<V>;
+    type Target = V;
     fn deref(&self) -> &Self::Target {
-        unsafe { self.node.as_ref() }
-    }
-}
-
-impl<'a, V> core::ops::Drop for Entry<'a, V> {
-    fn drop(&mut self) {
-        UNIQUE_FAMILY.eager_reclaim();
+        unsafe { &self.node.as_ref().val }
     }
 }
 
@@ -284,20 +270,53 @@ impl<'a, V> From<NodeRef<'a, V>> for Entry<'a, V> {
     }
 }
 
-pub struct Iter<'a, V> {
-    next: Option<NodeRef<'a, V>>,
+pub struct IntoIter<V> {
+    stack: Stack<V>,
 }
 
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = NodeRef<'a, V>;
+impl<V> Iterator for IntoIter<V> {
+    type Item = V;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(next) = self.next.take() {
-            self.next = NodeRef::from_maybe_tagged(&next.next);
-            return Some(next);
+        let next = self.stack.head.load(Ordering::Acquire);
+        if next.is_null() {
+            return None;
         }
 
-        None
+        unsafe {
+            self.stack
+                .head
+                .store((*next).next.load(Ordering::Acquire), Ordering::Release);
+
+            let val = core::ptr::read(&(*next).val);
+
+            Node::<V>::dealloc(next);
+
+            Some(val)
+        }
+    }
+}
+
+impl<V> IntoIterator for Stack<V> {
+    type Item = V;
+    type IntoIter = IntoIter<V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { stack: self }
+    }
+}
+
+impl<V> FromIterator<V> for Stack<V>
+where
+    V: Send + Sync,
+{
+    fn from_iter<T: IntoIterator<Item = V>>(iter: T) -> Self {
+        let stack = Stack::new();
+        for val in iter {
+            stack.push(val);
+        }
+
+        stack
     }
 }
 
@@ -305,6 +324,21 @@ mod test {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[derive(Debug)]
+    struct CountOnDrop<V> {
+        val: V,
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl<V> Drop for CountOnDrop<V> {
+        fn drop(&mut self) {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe impl<V> Send for CountOnDrop<V> {}
+    unsafe impl<V> Sync for CountOnDrop<V> {}
 
     #[test]
     fn test_new_node() {
@@ -336,7 +370,7 @@ mod test {
             let list = list.clone();
 
             threads.push(std::thread::spawn(move || {
-                for j in 0..100 {
+                for _ in 0..100 {
                     if rand::random::<u8>() % 3 != 0 {
                         list.push(i);
                     } else {
@@ -350,7 +384,10 @@ mod test {
             thead.join().unwrap();
         }
 
-        list.iter().for_each(|n| println!("val: {}", n.val));
+        Arc::try_unwrap(list)
+            .unwrap()
+            .into_iter()
+            .for_each(|e| println!("{}", e));
     }
 
     #[test]
@@ -373,8 +410,75 @@ mod test {
 
         stack.extend(other);
 
-        let actual: Vec<i32> = stack.iter().map(|e| e.val).collect();
+        let actual: Vec<i32> = stack.into_iter().map(|e| e).collect();
 
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_hazard() {
+        let stack = Stack::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        stack.extend(
+            vec![
+                CountOnDrop {
+                    counter: counter.clone(),
+                    val: 0,
+                },
+                CountOnDrop {
+                    counter: counter.clone(),
+                    val: 2,
+                },
+                CountOnDrop {
+                    counter: counter.clone(),
+                    val: 3,
+                },
+            ]
+            .into_iter()
+            .fold(Stack::new(), |stack, e| {
+                stack.push(e);
+                stack
+            }),
+        );
+
+        let top = stack.peek().unwrap();
+
+        let owned = stack.pop().unwrap();
+
+        assert_eq!(top.val, owned.val);
+
+        drop(owned);
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        assert!(top.val != -1);
+
+        drop(top);
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        stack.domain.eager_reclaim();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        stack.pop();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        stack.pop();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        stack.push(CountOnDrop {
+            val: 0,
+            counter: counter.clone(),
+        });
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        stack.pop();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
 }
