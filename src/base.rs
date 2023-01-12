@@ -94,7 +94,7 @@ where
             self.head
                 .compare_exchange(head_ptr, node_ptr, Ordering::AcqRel, Ordering::Relaxed)
         {
-            node.next.store(now, Ordering::SeqCst);
+            node.next.store(now, Ordering::Release);
             head_ptr = now;
         }
 
@@ -104,17 +104,17 @@ where
     pub fn pop(&self) -> Option<Entry<'_, V>> {
         let mut old_head = NodeRef::from_atomic_ptr(&self.head)?;
 
-        let mut next_ptr = old_head.next.load(Ordering::SeqCst);
+        let mut next_ptr = old_head.next.load(Ordering::Acquire);
 
         while let Err(_) = self.head.compare_exchange(
             old_head.as_ptr(),
             next_ptr,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
         ) {
             old_head = NodeRef::from_atomic_ptr(&self.head)?;
 
-            next_ptr = old_head.next.load(Ordering::SeqCst);
+            next_ptr = old_head.next.load(Ordering::Acquire);
         }
 
         unsafe {
@@ -129,37 +129,36 @@ where
         NodeRef::from_atomic_ptr(&self.head).map(|n| n.into())
     }
 
-    pub fn extend(&self, other: Self) {
+    pub fn append(&self, other: Self) {
         let Some(new_head) = NodeRef::from_atomic_ptr(&other.head) else {
             return;
         };
 
-        other.head.store(null_mut(), Ordering::SeqCst);
+        other.head.store(null_mut(), Ordering::Release);
 
         let mut tail = new_head.as_ptr();
 
         unsafe {
-            while !(*tail).next.load(Ordering::SeqCst).is_null() {
-                tail = (*tail).next.load(Ordering::SeqCst);
+            while !(*tail).next.load(Ordering::Acquire).is_null() {
+                tail = (*tail).next.load(Ordering::Acquire);
             }
             tail
         };
 
-        let mut old_head = self.head.load(Ordering::SeqCst);
-
+        let mut old_head = self.head.load(Ordering::Acquire);
         unsafe {
-            (*tail).next.store(old_head, Ordering::SeqCst);
+            (*tail).next.store(old_head, Ordering::Release);
         }
 
         while let Err(head_now) = self.head.compare_exchange(
             old_head,
             new_head.as_ptr(),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
         ) {
             old_head = head_now;
             unsafe {
-                (*tail).next.store(old_head, Ordering::SeqCst);
+                (*tail).next.store(old_head, Ordering::Release);
             }
         }
     }
@@ -170,12 +169,12 @@ impl<V> Drop for Stack<V> {
         // Deallocate all pointers that are no longer referred to.
         self.domain.eager_reclaim();
 
-        let mut curr = self.head.load(Ordering::SeqCst);
+        let mut curr = self.head.load(Ordering::Acquire);
 
         // # Safety: We have exclusive ownership of self.
         unsafe {
             while !curr.is_null() {
-                let next = (*curr).next.load(Ordering::SeqCst);
+                let next = (*curr).next.load(Ordering::Acquire);
                 Node::drop(curr);
                 curr = next;
             }
@@ -391,7 +390,7 @@ mod test {
     }
 
     #[test]
-    fn test_extend() {
+    fn test_append() {
         let expected = vec![2, 3, 7, 2, 0, 0, 3, 4, 2, 5];
 
         let stack = Stack::new();
@@ -408,7 +407,7 @@ mod test {
             .rev()
             .for_each(|&e| other.push(e));
 
-        stack.extend(other);
+        stack.append(other);
 
         let actual: Vec<i32> = stack.into_iter().map(|e| e).collect();
 
@@ -420,7 +419,7 @@ mod test {
         let stack = Stack::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        stack.extend(
+        stack.append(
             vec![
                 CountOnDrop {
                     counter: counter.clone(),

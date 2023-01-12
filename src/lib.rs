@@ -49,6 +49,6 @@ pub enum Operation<T> {
     Push { item: T },
     Pop,
     PopPush,
-    Ext { items: Vec<T> },
+    Append { items: Vec<T> },
     Peek,
 }

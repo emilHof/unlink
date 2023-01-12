@@ -19,7 +19,7 @@ fuzz_target!(|ops: Vec<unlink::Operation<i32>>| {
             sub_ops.into_iter().for_each(|op| match op {
                 Operation::Peek => {
                     if let Some(e) = stack.peek() {
-                        std::thread::sleep(std::time::Duration::from_nano(10));
+                        std::thread::sleep(std::time::Duration::from_nanos(10));
                         stack.push(Arc::new(**e));
                     }
                 }
@@ -32,12 +32,12 @@ fuzz_target!(|ops: Vec<unlink::Operation<i32>>| {
                     }
                 }
                 Operation::Push { item } => stack.push(Arc::new(item)),
-                Operation::Ext { items } => {
+                Operation::Append { items } => {
                     let other = Stack::new();
                     items
                         .into_iter()
                         .for_each(|item| other.push(Arc::new(item)));
-                    stack.extend(other);
+                    stack.append(other);
                 }
             })
         }))
