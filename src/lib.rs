@@ -28,7 +28,7 @@
 //!
 //!     s.spawn(move || {
 //!         for i in 0..10_usize {
-//!             stack.extend(vec![i.pow(2), i.pow(3), i.pow(4)].into_iter().collect());
+//!             stack.append(vec![i.pow(2), i.pow(3), i.pow(4)].into_iter().collect());
 //!         }
 //!     });
 //! });

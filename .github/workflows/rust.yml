@@ -19,7 +19,7 @@ jobs:
     - name: Toolchain
       run: rustup override set nightly
     - name: Install miri
-      run: cargo miri install
+      run: rustup component add miri --toolchain nightly-x86_64-unknown-linux-gnu
     - name: Build
       run: cargo build --verbose
     - name: Run tests
